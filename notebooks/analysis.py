@@ -2,6 +2,7 @@ import csv
 import glob
 import logging
 import os
+import time
 import warnings
 from datetime import datetime
 from typing import TypeVar
@@ -13,7 +14,6 @@ import rasterio
 import xarray as xr
 import zarr
 from dask.distributed import Client, LocalCluster
-from download import download_model_constants
 from pyproj import Transformer
 from rasterio.transform import from_origin
 from rasterio.windows import Window, from_bounds
@@ -29,17 +29,13 @@ GOSIF_SCALE_FACTOR = 0.0001
 # EASE-Grid 2.0 Global (9 km) projection used by SMAP L4 x/y coordinates (meters).
 EASE2_GLOBAL_EPSG = "EPSG:6933"
 
-# SPL4SMLM land-model constants used to turn soil moisture into an SWDI.  These
-# live on the same 9 km EASE-Grid 2.0 cells as the SPL4SMGP soil moisture, so
-# their (y, x) arrays align 1:1 with sm_rootzone.
-LMC_GROUP = "Land-Model-Constants_Data"
-FIELD_CAPACITY_VAR = "clsm_cdcr2"  # column water capacity (kg m-2)
-PROFILE_DEPTH_VAR = "clsm_dzpr"  # soil profile thickness (m)
-WILTING_POINT_VAR = "clsm_wp"  # wilting point (m3 m-3)
-
-# Density of liquid water (kg m-3), used to convert clsm_cdcr2's column water
-# capacity (kg m-2) into a volumetric field capacity (m3 m-3).
-WATER_DENSITY = 1000.0
+# The SWDI's field capacity and wilting point are derived empirically, per grid
+# cell over the 2015-2025 SMAP L4 record in our VDS. This replaces the earlier
+# approach of reading them from the SPL4SMLM land-model constants file, which is
+# not a valid basis for this index. Field capacity is the high percentile and
+# wilting point is the low percentile.
+FC_PERCENTILE = 0.95
+WP_PERCENTILE = 0.05
 
 
 def get_read_window(
@@ -290,8 +286,7 @@ def detect_flash_drought_sif(
         else:
             detection = np.zeros(rci_grid.shape, dtype=bool)
 
-        # Percent over valid land cells only; water/ice/fill (NaN) can never be
-        # flagged, so counting them would dilute the detection fraction.
+        # Percent over valid land cells only, water/ice/fill (NaN) don't get flagged.
         n_valid = int(np.count_nonzero(~np.isnan(rci_grid)))
         fd_percent = 100.0 * int(np.count_nonzero(detection)) / n_valid if n_valid else 0.0
 
@@ -327,12 +322,12 @@ def detect_flash_drought_swdi(
     Once a cell is positively detected, it remains detected until its SWDI
     rises above `abs_threshold`, at which point the cell reverts to a
     no-detection state and both conditions must be freshly satisfied to
-    re-trigger.  The chronological filename convention means a lexical sort
+    re-trigger. The chronological filename convention means a lexical sort
     is also a temporal sort.
 
     One GeoTIFF is written per time step to `output_dir` (same filename with
     a "fd_swdi_" prefix), carrying the source raster's CRS and transform,
-    where 1 marks a detection and 0 marks no detection.  The earliest
+    where 1 marks a detection and 0 marks no detection. The earliest
     `n_lookback` steps lack enough history and are all 0.
 
     The fraction of valid (non-NaN) grid cells flagged at each step is
@@ -349,7 +344,7 @@ def detect_flash_drought_swdi(
         abs_threshold (float): SWDI value a cell must be at or below to
             satisfy condition 2, and to sustain an existing detection.
         n_lookback (int): Number of preceding rasters over which the drop is
-            measured.  With a 3-day cadence, 10 rasters span 30 days.
+            measured. With a 3-day cadence, 10 rasters span 30 days.
 
     Returns:
         str: The output directory path.
@@ -387,7 +382,7 @@ def detect_flash_drought_swdi(
         below_threshold = swdi_grid <= abs_threshold
 
         if len(recent_grids) == n_lookback + 1:
-            # drop is negative when SWDI has fallen; rule1 is True when the
+            # drop is negative when SWDI has fallen, rule1 is True when the
             # magnitude of the fall meets the threshold.
             drop = recent_grids[-1] - recent_grids[0]
             rule1 = drop <= -drop_threshold
@@ -396,19 +391,17 @@ def detect_flash_drought_swdi(
             if persistent_detection is None:
                 persistent_detection = new_trigger
             else:
-                # Sustain existing detections that remain below the threshold;
-                # also admit cells that freshly satisfy both conditions.
+                # Sustain existing detections that remain below the threshold
                 persistent_detection = (persistent_detection | new_trigger) & below_threshold
         else:
-            # Not enough history for a new trigger; sustain any prior
-            # detections as long as the threshold condition still holds.
+            # Not enough history for a new trigger
             if persistent_detection is None:
                 persistent_detection = np.zeros(swdi_grid.shape, dtype=bool)
             else:
                 persistent_detection = persistent_detection & below_threshold
 
-        # Belt-and-suspenders NaN guard: fill cells should never appear as
-        # detections regardless of how the persistence mask evolves.
+        # NaN guard: fill cells should never appear as detections regardless
+        # of how the persistence mask evolves.
         assert persistent_detection is not None
         detection = np.where(np.isnan(swdi_grid), False, persistent_detection)
 
@@ -520,10 +513,9 @@ def latlon_bbox_to_ease(
 
     The SMAP L4 x/y coordinates are in meters in the EASE-Grid 2.0
     Global projection (EPSG:6933), so a geographic bounding box must be
-    reprojected before it can be used to index the grid.  EPSG:6933 is a
+    reprojected before it can be used to index the grid. EPSG:6933 is a
     cylindrical equal-area projection, so x depends only on longitude and
-    y only on latitude; transforming the four corners and taking the
-    min/max therefore yields exact axis-aligned bounds.
+    y only on latitude.
 
     Arguments:
         bbox: (west, south, east, north) in degrees (lon/lat, EPSG:4326).
@@ -573,46 +565,225 @@ def _select_bbox(
     return subset
 
 
-def load_field_capacity_wilting_point(
-    constants_path: str,
-    bbox: tuple[float, float, float, float],
-) -> tuple[xr.DataArray, xr.DataArray]:
-    """Extract volumetric field capacity and wilting point over a lat/lon box.
+def _read_record_in_blocks(
+    sm: xr.DataArray,
+    retries: int = 2,
+    retry_wait: float = 2.0,
+) -> xr.DataArray:
+    """Materialise `sm` over its whole time span, tolerating unreachable references.
 
-    The SPL4SMLM file stores the geophysical constants in the
-    Land-Model-Constants_Data group while the x/y coordinates live in the root
-    group, so the two are opened separately and the coordinates attached to the
-    constants before subsetting.
-
-    The wilting point (clsm_wp) is already a volumetric water content
-    (m3 m-3), matching sm_rootzone.  The field capacity, however, is taken from
-    clsm_cdcr2 -- the column water-holding capacity in kg m-2 integrated over
-    the soil profile depth clsm_dzpr (m).  Dividing it by the mass of a full
-    water column (depth x water density) converts it to a volumetric field
-    capacity (m3 m-3) so the SWDI's numerator and denominator are dimensionally
-    consistent.
+    If a chunk (aka a month) is repeatedly unreadable it gets skipped which will add uncertainty to
+    the percentiles but it's a tradeoff to get the large amount of data we're reading from the VDS to
+    process without throwing an exception.
 
     Arguments:
-        constants_path (str): Path to the SPL4SMLM HDF-5 granule (see
-            :func:`download_model_constants`).
-        bbox: (west, south, east, north) in degrees (lon/lat).
+        sm (xr.DataArray): Lazy root-zone soil moisture with (time, y, x) dims.
+        retries (int): Extra attempts per month after the first (so ``retries=2``
+            means up to three tries) before the month is skipped.
+        retry_wait (float): Base seconds to wait between attempts. The wait grows
+            with each attempt to let a transient outage clear.
+
+    Returns:
+        xr.DataArray: The successfully read months concatenated and sorted in
+        time, held in memory.
+
+    Raises:
+        RuntimeError: If no month could be read at all.
+    """
+    # Group by calendar month (YYYYMM) so a single bad reference costs only that
+    # month, and so no single read schedules all ~30k chunks at once.
+    month_id = sm["time"].dt.year * 100 + sm["time"].dt.month
+    blocks: list[xr.DataArray] = []
+    skipped = 0
+    for _, block in sm.groupby(month_id):
+        label = str(block["time"].values[0])[:7]
+        for attempt in range(retries + 1):
+            try:
+                blocks.append(block.compute())
+                break
+            except Exception as exc:  # noqa: BLE001 - tolerate any read failure
+                if attempt < retries:
+                    time.sleep(retry_wait * (attempt + 1))
+                    continue
+                skipped += 1
+                warnings.warn(
+                    f"Skipping {label} while reading soil moisture for the FC/WP "
+                    f"percentiles (unreadable after {retries + 1} tries): {exc!r}",
+                    stacklevel=2,
+                )
+    if not blocks:
+        msg = "Could not read any soil moisture for the FC/WP percentiles."
+        raise RuntimeError(msg)
+    if skipped:
+        warnings.warn(
+            f"FC/WP percentiles computed with {skipped} month(s) skipped due to "
+            "unreachable references.",
+            stacklevel=2,
+        )
+    return xr.concat(blocks, dim="time").sortby("time")
+
+
+def _field_capacity_wilting_point(
+    sm: xr.DataArray,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Derive per-cell field capacity and wilting point from soil-moisture percentiles.
+
+    Field capacity (the long-term "wet" level) and wilting point (the "dry"
+    level) are estimated at each grid cell as the ``FC_PERCENTILE`` and
+    ``WP_PERCENTILE`` quantiles of the root-zone soil moisture taken over the
+    entire time span of ``sm``, 2015-2025. The idea is that this record is long
+    enough for stable estimates of these distribution tails.
+    Cells that are entirely fill/water reduce to NaN.
+
+    The record is pulled into memory a month at a time by
+    :func:`_read_record_in_blocks` so a single unreachable granule does not throw an
+    exception for the whole 90+ minute process. The quantiles are then taken over the
+    time series in memory. This function is meant to work with small spatial regions
+    instead of global extent.
+
+    Arguments:
+        sm (xr.DataArray): Root-zone soil moisture with (time, y, x) dimensions,
+            already subset to the region of interest.
 
     Returns:
         tuple[xr.DataArray, xr.DataArray]: The (field_capacity, wilting_point)
-        DataArrays over the box, both in m3 m-3 and carrying the SMAP L4 x/y
-        coordinates so they align with a soil moisture subset over the same box.
+        DataArrays on the (y, x) grid of ``sm``, in the same units as ``sm``.
     """
-    open_kwargs = {"engine": "h5netcdf", "phony_dims": "sort"}
-    root = xr.open_dataset(constants_path, **open_kwargs)  # type: ignore[arg-type]
-    lmc = xr.open_dataset(constants_path, group=LMC_GROUP, **open_kwargs)  # type: ignore[arg-type]
-    lmc = lmc.assign_coords(x=root["x"], y=root["y"])
-
+    sm = _read_record_in_blocks(sm)
+    quantiles = sm.quantile([WP_PERCENTILE, FC_PERCENTILE], dim="time", skipna=True)
     field_capacity = (
-        lmc[FIELD_CAPACITY_VAR] / (lmc[PROFILE_DEPTH_VAR] * WATER_DENSITY)
-    ).rename("field_capacity")
-    wilting_point = lmc[WILTING_POINT_VAR].rename("wilting_point")
+        quantiles.sel(quantile=FC_PERCENTILE)
+        .drop_vars("quantile")
+        .rename("field_capacity")
+    )
+    wilting_point = (
+        quantiles.sel(quantile=WP_PERCENTILE)
+        .drop_vars("quantile")
+        .rename("wilting_point")
+    )
+    return field_capacity, wilting_point
 
-    return _select_bbox(field_capacity, bbox), _select_bbox(wilting_point, bbox)
+
+def _write_fc_wp_geotiff(
+    field_capacity: xr.DataArray,
+    wilting_point: xr.DataArray,
+    out_path: str,
+    bbox: tuple[float, float, float, float],
+    variable: str,
+) -> None:
+    """Cache per-cell field capacity and wilting point to a two-band GeoTIFF.
+
+    Band 1 is field capacity and band 2 is wilting point in m3/m3.  The
+    box, percentile levels and source variable are recorded as tags.
+    """
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # Orient north-up (row 0 = northernmost) and west-to-east so the array rows
+    # and columns line up with the affine transform -- and so a reader can
+    # reconstruct the coordinates simply by sorting the grid the same way.
+    field_capacity = field_capacity.sortby("y", ascending=False).sortby("x").transpose("y", "x")
+    wilting_point = wilting_point.sortby("y", ascending=False).sortby("x").transpose("y", "x")
+    transform = ease2_grid_transform(field_capacity.x.values, field_capacity.y.values)
+
+    with rasterio.open(
+        out_path,
+        "w",
+        driver="GTiff",
+        height=field_capacity.sizes["y"],
+        width=field_capacity.sizes["x"],
+        count=2,
+        dtype="float64",
+        crs=EASE2_GLOBAL_EPSG,
+        transform=transform,
+        nodata=np.nan,
+    ) as dst:
+        dst.write(field_capacity.values, 1)
+        dst.write(wilting_point.values, 2)
+        dst.set_band_description(1, "field_capacity")
+        dst.set_band_description(2, "wilting_point")
+        dst.update_tags(
+            bbox=",".join(repr(float(b)) for b in bbox),
+            fc_percentile=repr(FC_PERCENTILE),
+            wp_percentile=repr(WP_PERCENTILE),
+            variable=variable,
+        )
+
+
+def _read_fc_wp_geotiff(
+    cache_path: str,
+    sm: xr.DataArray,
+    bbox: tuple[float, float, float, float],
+    variable: str,
+) -> tuple[xr.DataArray, xr.DataArray] | None:
+    """Read cached field capacity and wilting point, or None if the cache does not fit.
+
+    The cache is reused only when its stored box, percentile levels, source
+    variable and grid shape all match the current request, otherwise None is
+    returned so the caller recomputes (and overwrites) it. The two bands are
+    wrapped as DataArrays carrying ``sm``'s own y/x coordinate values (sorted
+    into the north-up, west-to-east layout the file was written in) so they align
+    cell-for-cell with the soil moisture when the SWDI is formed.
+    """
+    with rasterio.open(cache_path) as src:
+        if src.count < 2:
+            return None
+
+        tags = src.tags()
+        expected = {
+            "fc_percentile": repr(FC_PERCENTILE),
+            "wp_percentile": repr(WP_PERCENTILE),
+            "variable": variable,
+        }
+        if any(tags.get(key) != value for key, value in expected.items()):
+            return None
+        try:
+            cached_bbox = [float(v) for v in tags.get("bbox", "").split(",")]
+        except ValueError:
+            return None
+        if len(cached_bbox) != 4 or not np.allclose(cached_bbox, bbox):
+            return None
+
+        y = np.sort(sm["y"].values)[::-1]
+        x = np.sort(sm["x"].values)
+        if (src.height, src.width) != (y.size, x.size):
+            return None
+
+        field_capacity = src.read(1).astype("float64")
+        wilting_point = src.read(2).astype("float64")
+
+    coords = {"y": ("y", y), "x": ("x", x)}
+    return (
+        xr.DataArray(field_capacity, dims=("y", "x"), coords=coords, name="field_capacity"),
+        xr.DataArray(wilting_point, dims=("y", "x"), coords=coords, name="wilting_point"),
+    )
+
+
+def _load_or_compute_fc_wp(
+    sm: xr.DataArray,
+    cache_path: str | None,
+    bbox: tuple[float, float, float, float],
+    variable: str,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Return per-cell field capacity and wilting point, using the cache when usable.
+
+    When ``cache_path`` names an existing two-band GeoTIFF that matches this box,
+    the constants are read straight from it. Otherwise they are derived from the
+    soil-moisture percentiles (:func:`_field_capacity_wilting_point`),
+    materialised, and -- when ``cache_path`` is given -- written out so later runs
+    can skip the expensive percentile computation.
+    """
+    if cache_path is not None and os.path.exists(cache_path):
+        cached = _read_fc_wp_geotiff(cache_path, sm, bbox, variable)
+        if cached is not None:
+            return cached
+
+    field_capacity, wilting_point = _field_capacity_wilting_point(sm)
+    field_capacity, wilting_point = field_capacity.compute(), wilting_point.compute()
+
+    if cache_path is not None:
+        _write_fc_wp_geotiff(field_capacity, wilting_point, cache_path, bbox, variable)
+
+    return field_capacity, wilting_point
 
 
 def ease2_grid_transform(x: np.ndarray, y: np.ndarray):
@@ -622,7 +793,7 @@ def ease2_grid_transform(x: np.ndarray, y: np.ndarray):
     grid, so the pixel size is the coordinate spacing and the raster origin is
     the outer corner of the north-west cell (half a pixel beyond the extreme
     centers).  min/max are used so the transform is correct regardless of
-    whether x/y are stored ascending or descending; callers must orient the
+    whether x/y are stored ascending or descending. Callers must orient the
     array itself north-up (row 0 = northernmost row) to match.
     """
     xres = abs(float(x[1] - x[0]))
@@ -634,38 +805,48 @@ def ease2_grid_transform(x: np.ndarray, y: np.ndarray):
 
 def swdi_timeseries(
     ds: xr.Dataset,
-    constants_path: str,
     bbox: tuple[float, float, float, float],
     freq: str = "3D",
     variable: str = "sm_rootzone",
     start: str | None = None,
     stop: str | None = None,
     raster_dir: str | None = None,
+    fc_wp_path: str | None = None,
 ) -> xr.DataArray:
     """Compute a box-averaged Soil Water Deficit Index (SWDI) time series.
     The SWDI is computed per cell and then spatially averaged over the bbox.
 
+    Field capacity and wilting point are derived per cell from percentiles of
+    the root-zone soil moisture over the *whole* time span of ``ds``. That
+    percentile calculation is expensive, so the result is cached to a two-band
+    GeoTIFF at ``fc_wp_path`` (band 1 field capacity, band 2 wilting point) and
+    reused on later runs (see :func:`_load_or_compute_fc_wp`).
+
     Field capacity and wilting point are constant in time, so aggregating the
     soil moisture to `freq` windows before forming the (linear) SWDI is
-    equivalent to forming it first and then aggregating; the soil moisture is
+    equivalent to forming it first and then aggregating. The soil moisture is
     resampled first so each window's SWDI is built from that window's moisture.
 
     Arguments:
-        ds (xr.Dataset): The SMAP L4 virtual dataset.
-        constants_path (str): Path to the SPL4SMLM HDF-5 granule.
+        ds (xr.Dataset): The SMAP L4 virtual dataset. Its full time span is used
+            to derive field capacity and wilting point.
         bbox: (west, south, east, north) in degrees (lon/lat).
         freq (str): Pandas offset alias for the temporal aggregation window
             ("3D" = 3-day means).
         variable (str): The root-zone soil moisture variable to use.
-        start (str | None): Optional start date (e.g. "2019" or "2019-01-01").
-            If None, begins at the start of the dataset.
+        start (str | None): Optional start date (e.g. "2019" or "2019-01-01")
+            for the returned series. If None, begins at the start of the dataset.
         stop (str | None): Optional end date (e.g. "2019" or "2019-12-31"),
             inclusive. If None, runs to the end of the dataset.
         raster_dir (str | None): Optional directory in which to save the
             non-spatially-averaged per-cell SWDI grid for each time step as a
             georeferenced GeoTIFF (EPSG:6933), named
             "swdi_{year}_{month}_{day}.tif" (ordered so the files sort
-            chronologically).  If None, no rasters are written.
+            chronologically). If None, no rasters are written.
+        fc_wp_path (str | None): Optional path to the two-band field capacity /
+            wilting point GeoTIFF cache. Read from when it already matches this
+            box, otherwise (re)computed and written. If None, the constants are
+            computed without being cached.
 
     Returns:
         xr.DataArray: A 1-D DataArray of the box-averaged SWDI indexed by time.
@@ -674,18 +855,20 @@ def swdi_timeseries(
         ValueError: If the bounding box does not overlap the dataset grid.
     """
     subset = _select_bbox(ds, bbox)
+    sm_full = subset[variable]
 
-    if start is not None or stop is not None:
-        subset = subset.sel(time=slice(start, stop))
-
-    sm = subset[variable].resample(time=freq).mean()
-
-    # Per-cell field capacity and wilting point over the same box; the shared
-    # _select_bbox selection guarantees identical x/y coordinates, so xarray
-    # broadcasts them against the (time, y, x) soil moisture cell-for-cell.
-    field_capacity, wilting_point = load_field_capacity_wilting_point(
-        constants_path, bbox
+    # Per-cell field capacity and wilting point from the full-record percentiles
+    # (cached to GeoTIFF).  Their x/y coordinates come from the same box subset,
+    # so xarray broadcasts them against the (time, y, x) soil moisture
+    # cell-for-cell.
+    field_capacity, wilting_point = _load_or_compute_fc_wp(
+        sm_full, fc_wp_path, bbox, variable
     )
+
+    sm = sm_full
+    if start is not None or stop is not None:
+        sm = sm.sel(time=slice(start, stop))
+    sm = sm.resample(time=freq).mean()
 
     swdi = (sm - field_capacity) / (field_capacity - wilting_point) * 10.0
 
@@ -732,13 +915,18 @@ def compute_swdi_timeseries(
         bbox: tuple[float, float, float, float],
         ref_url: str = "https://its-live-data.s3-us-west-2.amazonaws.com/test-space/vds/SPL4SMGP.parquet",
         raster_dir: str | None = None,
+        fc_wp_path: str | None = None,
 ) -> str:
-    constants_path = download_model_constants()
     ds, client, cluster, created = open_virtual_dataset(ref_url)
     try:
+        if fc_wp_path is None:
+            stem = os.path.splitext(os.path.basename(time_series_fname))[0]
+            fc_wp_path = os.path.join("inputs", f"{stem}_fc_wp.tif")
+
         swdi_ts = swdi_timeseries(
-            ds, constants_path, bbox,
-            start=start_date, stop=stop_date, raster_dir=raster_dir,
+            ds, bbox,
+            start=start_date, stop=stop_date,
+            raster_dir=raster_dir, fc_wp_path=fc_wp_path,
         )
         csv_path = os.path.join("data", time_series_fname)
 
