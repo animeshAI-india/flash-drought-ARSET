@@ -2,7 +2,7 @@
 
 An interactive web-based mapping project to monitor and visualize Flash Drought conditions in **Jhargram District, West Bengal** using NASA ARSET methodologies.
 
-🔗 **Live Demo:** https://animeshAI-india.github.io/flash-drought-ARSET/jhargram_map.html
+🔗 *Live Demo:* [Click Here to View Map](https://animeshai-india.github.io/flash-drought-ARSET/jhargram_map.html)
 
 ---
 
